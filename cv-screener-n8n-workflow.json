@@ -1,0 +1,218 @@
+{
+  "name": "CV Screener — Notion Talent Board",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [{ "mode": "everyMinute" }]
+        },
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_URL",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Form Responses 1",
+          "mode": "name"
+        },
+        "event": "rowAdded",
+        "options": {}
+      },
+      "id": "node-1-sheets-trigger",
+      "name": "Google Sheets Trigger",
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_CRED_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "notes": "Polls every 60 seconds for new form submissions. No webhook needed — reliable for Google Forms."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://www.googleapis.com/drive/v3/files/' + $json['Upload your CV'].split('id=')[1] + '?alt=media' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "cv_binary"
+            }
+          }
+        }
+      },
+      "id": "node-2-drive-fetch",
+      "name": "HTTP Request — Fetch CV from Drive",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "YOUR_GOOGLE_CRED_ID",
+          "name": "Google Drive OAuth2"
+        }
+      },
+      "notes": "Fetches the actual binary file from Google Drive. The URL column name must match your form field label exactly."
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const binaryData = $input.first().binary?.cv_binary;\nif (!binaryData) {\n  throw new Error('No CV file found in binary data. Check the field name matches your Google Form upload field.');\n}\n\nconst base64 = binaryData.data;\nconst mimeType = binaryData.mimeType || 'application/pdf';\nconst formData = $input.first().json;\n\nreturn [{\n  json: {\n    cv_base64: base64,\n    cv_mime_type: mimeType,\n    applicant_name: formData['Full Name'],\n    applicant_email: formData['Email Address'],\n    role: formData['Role Applying For'],\n    experience_years: formData['Years of Experience'],\n    submitted_at: formData['Timestamp'],\n  }\n}];"
+      },
+      "id": "node-3-extract-code",
+      "name": "Code — Extract & Prepare CV Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "notes": "Converts binary CV to base64. Organises all form fields into clean JSON for downstream nodes."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-goog-api-key", "value": "YOUR_GEMINI_API_KEY" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"contents\": [{\n    \"parts\": [\n      {\n        \"inline_data\": {\n          \"mime_type\": \"{{ $json.cv_mime_type }}\",\n          \"data\": \"{{ $json.cv_base64 }}\"\n        }\n      },\n      {\n        \"text\": \"You are a senior recruiter screening CVs for a {{ $json.role }} role. The candidate has {{ $json.experience_years }} years of experience. Carefully read the attached CV and evaluate the candidate. Respond ONLY with valid JSON — no markdown, no code fences, no explanation. Your response must start with { and end with }. Required keys: score (integer 1-10 where 10 is perfect fit), strengths (string, 2-3 sentences about the candidate's strongest points), gaps (string, 2-3 sentences about missing skills or concerns), recommendation (exactly one of: Strong Yes, Yes, or No).\"\n      }\n    ]\n  }]\n}"
+      },
+      "id": "node-4-gemini-ai",
+      "name": "HTTP Request — Gemini AI Screening",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300],
+      "notes": "CRITICAL: The prompt must force strict JSON output. If Gemini returns prose, the downstream Code node will throw a JSON.parse error."
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const geminiResponse = $input.first().json;\n\n// Extract the raw text from Gemini's nested response structure\nconst rawText = geminiResponse.candidates?.[0]?.content?.parts?.[0]?.text;\n\nif (!rawText) {\n  throw new Error('Gemini returned empty response. Check your API key and request format.');\n}\n\n// Clean accidental markdown fences that Gemini sometimes adds\nconst cleaned = rawText\n  .replace(/```json/g, '')\n  .replace(/```/g, '')\n  .trim();\n\nlet screening;\ntry {\n  screening = JSON.parse(cleaned);\n} catch (e) {\n  throw new Error(`Gemini returned invalid JSON. Raw response: ${rawText}`);\n}\n\n// Validate required fields\nif (!screening.score || !screening.recommendation) {\n  throw new Error(`Gemini JSON missing required fields. Got: ${JSON.stringify(screening)}`);\n}\n\n// Merge with applicant data from the previous Code node\nconst prev = $('Code — Extract & Prepare CV Data').first().json;\n\nreturn [{\n  json: {\n    ...prev,\n    ai_score: Number(screening.score),\n    ai_strengths: screening.strengths || 'Not provided',\n    ai_gaps: screening.gaps || 'Not provided',\n    ai_recommendation: screening.recommendation,\n    gemini_raw: rawText\n  }\n}];"
+      },
+      "id": "node-5-parse-code",
+      "name": "Code — Parse Gemini Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300],
+      "notes": "Extracts score from Gemini's nested candidates array. Includes validation and error handling. Merges AI results with applicant data."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer YOUR_NOTION_INTEGRATION_TOKEN" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Notion-Version", "value": "2022-06-28" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"parent\": { \"database_id\": \"YOUR_NOTION_DATABASE_ID\" },\n  \"properties\": {\n    \"Name\": { \"title\": [{ \"text\": { \"content\": \"{{ $json.applicant_name }}\" } }] },\n    \"Email\": { \"email\": \"{{ $json.applicant_email }}\" },\n    \"Role\": { \"select\": { \"name\": \"{{ $json.role }}\" } },\n    \"AI Score\": { \"number\": {{ $json.ai_score }} },\n    \"Strengths\": { \"rich_text\": [{ \"text\": { \"content\": \"{{ $json.ai_strengths }}\" } }] },\n    \"Gaps\": { \"rich_text\": [{ \"text\": { \"content\": \"{{ $json.ai_gaps }}\" } }] },\n    \"Recommendation\": { \"select\": { \"name\": \"{{ $json.ai_recommendation }}\" } },\n    \"Applied At\": { \"date\": { \"start\": \"{{ $json.submitted_at }}\" } },\n    \"Status\": { \"select\": { \"name\": \"To Review\" } }\n  }\n}"
+      },
+      "id": "node-6-notion-create",
+      "name": "HTTP Request — Create Notion Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 300],
+      "notes": "Creates a new candidate card in your Notion Talent Board. All 9 properties must match your database schema exactly — type mismatches cause 400 errors."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "score-check",
+              "leftValue": "={{ $json.ai_score }}",
+              "rightValue": 7,
+              "operator": { "type": "number", "operation": "gte" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-7-if-score",
+      "name": "IF — Score >= 7?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 300],
+      "notes": "TRUE branch: high-scoring candidate → WhatsApp alert. FALSE branch: workflow ends — candidate is still logged in Notion."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v18.0/YOUR_WHATSAPP_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer YOUR_WHATSAPP_ACCESS_TOKEN" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"HIRING_MANAGER_WHATSAPP_NUMBER\",\n  \"type\": \"text\",\n  \"text\": {\n    \"body\": \"🔔 *Strong Candidate Alert!*\\n\\n*Name:* {{ $json.applicant_name }}\\n*Role:* {{ $json.role }}\\n*AI Score:* {{ $json.ai_score }}/10\\n*Recommendation:* {{ $json.ai_recommendation }}\\n\\n*Strengths:*\\n{{ $json.ai_strengths }}\\n\\n*Gaps:*\\n{{ $json.ai_gaps }}\\n\\n📋 *View in Notion:* {{ $('HTTP Request — Create Notion Page').item.json.url }}\"\n  }\n}"
+      },
+      "id": "node-8-whatsapp-alert",
+      "name": "HTTP Request — WhatsApp Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 200],
+      "notes": "Only fires for candidates scoring 7 or above. Sends full candidate summary with Notion link to hiring manager. WhatsApp tokens expire after 24hrs — use a system user token for production."
+    }
+  ],
+  "connections": {
+    "Google Sheets Trigger": {
+      "main": [[{ "node": "HTTP Request — Fetch CV from Drive", "type": "main", "index": 0 }]]
+    },
+    "HTTP Request — Fetch CV from Drive": {
+      "main": [[{ "node": "Code — Extract & Prepare CV Data", "type": "main", "index": 0 }]]
+    },
+    "Code — Extract & Prepare CV Data": {
+      "main": [[{ "node": "HTTP Request — Gemini AI Screening", "type": "main", "index": 0 }]]
+    },
+    "HTTP Request — Gemini AI Screening": {
+      "main": [[{ "node": "Code — Parse Gemini Response", "type": "main", "index": 0 }]]
+    },
+    "Code — Parse Gemini Response": {
+      "main": [[{ "node": "HTTP Request — Create Notion Page", "type": "main", "index": 0 }]]
+    },
+    "HTTP Request — Create Notion Page": {
+      "main": [[{ "node": "IF — Score >= 7?", "type": "main", "index": 0 }]]
+    },
+    "IF — Score >= 7?": {
+      "main": [
+        [{ "node": "HTTP Request — WhatsApp Alert", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [
+    { "createdAt": "2024-01-01T00:00:00.000Z", "updatedAt": "2024-01-01T00:00:00.000Z", "id": "workshop-2-project-02", "name": "Workshop 2.0 — Project 02" }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "workshop-2-0-cv-screener-v1"
+}
